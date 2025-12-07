@@ -1,0 +1,38 @@
+# Build folders
+/Debug/
+/Release/
+/build/
+
+# IDE metadata
+/.settings/
+/.cproject
+/.project
+/.mxproject
+/.metadata/
+/.idea/
+/.vscode/
+/.ipch/
+
+# STM32Cube artifacts
+*.launch
+*.list
+*.map
+*.elf
+*.bin
+*.hex
+*.s19
+*.d
+*.o
+*.su
+*.py.log
+*.stldr
+
+# Logs and misc
+*.log
+*.tmp
+*.bak
+*.swp
+
+# Python cache (in case helper scripts are added)
+__pycache__/
+*.pyc
