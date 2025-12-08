@@ -25,7 +25,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-
+#include "udp_client.h"
+#include "udp_app.h"
+#include "udp_app.h"
 #include "myactuator_rmd/actuator_interface.hpp"
 #include "myactuator_rmd/actuator_state/acceleration_type.hpp"
 #include "myactuator_rmd/actuator_state/feedback.hpp"
@@ -57,6 +59,8 @@ TIM_HandleTypeDef htim2;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
+extern uint8_t netif_up_flag;
+
 namespace {
   constexpr uint32_t kMotorCanId = 1U;
   constexpr uint32_t kSpeedAccelDps2 = 8000U;
@@ -86,6 +90,14 @@ static void WriteAccelerationRaw(std::uint32_t acceleration, myactuator_rmd::Acc
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+extern "C" int _write(int file, char *ptr, int len)
+{
+    HAL_UART_Transmit(&huart3, reinterpret_cast<uint8_t *>(ptr),
+                      len,
+                      HAL_UART_TIMEOUT_VALUE);
+    return len;
+}
+
 
 /* USER CODE END 0 */
 
@@ -134,6 +146,14 @@ int main(void)
   MX_USART3_UART_Init();
   MX_LWIP_Init();
   /* USER CODE BEGIN 2 */
+  HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_SET);  // turn on
+  while (!netif_up_flag) {
+      MX_LWIP_Process();
+  }
+  HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_RESET); // turn off
+
+  udp_app_init();
+
   Stm32CanDriver can_driver(&hfdcan1);
   myactuator_rmd::ActuatorInterface motor(can_driver, kMotorCanId);
 
@@ -154,8 +174,45 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    MX_LWIP_Process();  // pump lwIP every iteration
+
     uint32_t const now = HAL_GetTick();
     float const current_angle = motor.getMultiTurnAngle();
+
+    uint8_t  cmd[32];
+    uint16_t n = udp_app_try_get_latest(cmd, sizeof(cmd));
+    if (n > 0)
+    {
+        if (n >= sizeof(cmd)) n = sizeof(cmd) - 1;
+        cmd[n] = '\0';  // allow strtof to read a C-string
+
+        char* payload = reinterpret_cast<char*>(cmd);
+
+        // Expect "TORQUE,<value>"
+        if (std::strncmp(payload, "TORQUE,", 7) == 0)
+        {
+            char* end = nullptr;
+            float new_torque = std::strtof(payload + 7, &end);
+            if (end != (payload + 7))     // parsed something
+            {
+                if (new_torque > kTorqueLimitNm)       new_torque = kTorqueLimitNm;
+                else if (new_torque < -kTorqueLimitNm) new_torque = -kTorqueLimitNm;
+
+                motor.sendTorqueSetpoint(new_torque, kTorqueConstantNmPerA);
+            }
+        }
+        // If you ever want to accept raw floats (no "TORQUE," prefix), you could add an else branch here.
+
+        char resp[48];
+        int len = std::snprintf(resp, sizeof(resp), "ANGLE,%.3f\n", current_angle);
+        if (len > 0)
+        {
+            udp_app_send_reply(resp, static_cast<uint16_t>(len));
+        }
+    }
+
+
+    /*
     float const position_error = current_angle - kDesiredAngleDeg;
     float torque_command = -kSpringCoefficient * position_error * std::fabs(position_error);
     if (torque_command > kTorqueLimitNm)
@@ -167,10 +224,26 @@ int main(void)
       torque_command = -kTorqueLimitNm;
     }
     auto feedback = motor.sendTorqueSetpoint(torque_command, kTorqueConstantNmPerA);
+    
+
+
+    uint8_t cmd[32];
+    if (udp_app_try_get_latest(cmd, sizeof(cmd)) >= 6 &&
+        memcmp(cmd, "ANGLE?", 6) == 0) {
+        char resp[48];
+        int len = snprintf(resp, sizeof(resp), "ANGLE,%.3f\n", current_angle);
+        if (len > 0) {
+            udp_app_send_reply(resp, static_cast<uint16_t>(len));
+        }
+    }
+
+    */
+
+    
 
     if ((now - last_feedback_print) >= kFeedbackPrintPeriodMs)
     {
-      PrintFeedback(feedback);
+      //PrintFeedback(feedback);
       last_feedback_print = now;
     }
 

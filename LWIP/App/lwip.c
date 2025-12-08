@@ -51,7 +51,7 @@ uint8_t NETMASK_ADDRESS[4];
 uint8_t GATEWAY_ADDRESS[4];
 
 /* USER CODE BEGIN 2 */
-
+uint8_t netif_up_flag = 0;
 /* USER CODE END 2 */
 
 /**
@@ -166,6 +166,7 @@ static void ethernet_link_status_updated(struct netif *netif)
   if (netif_is_up(netif))
   {
 /* USER CODE BEGIN 5 */
+    netif_up_flag = 1;
 /* USER CODE END 5 */
   }
   else /* netif is down */
