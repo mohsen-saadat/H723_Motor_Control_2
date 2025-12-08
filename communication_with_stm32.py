@@ -10,7 +10,7 @@ PERIOD         = 1.0 / LOOP_HZ
 # Match the constants in main.cpp
 SPRING_COEFF   = 0.00002
 DESIRED_ANGLE  = 0.0
-TORQUE_LIMIT   = 4.0
+TORQUE_LIMIT   = 8.0
 
 def clamp(val, limit):
     if val >  limit: return limit
@@ -22,14 +22,28 @@ def compute_torque(angle_deg):
     torque = -SPRING_COEFF * error * abs(error)
     return clamp(torque, TORQUE_LIMIT)
 
-def parse_angle(packet):
+def parse_angle_current(packet):
+    """
+    Expected format: ANGLE,<deg>[,CURRENT,<amps>]
+    Returns (angle_deg, current_amps or None)
+    """
     text = packet.decode(errors="ignore").strip()
-    if not text.upper().startswith("ANGLE,"):
+    parts = text.split(",")
+    if len(parts) < 2 or parts[0].upper() != "ANGLE":
         return None
     try:
-        return float(text.split(",", 1)[1])
+        angle = float(parts[1])
     except ValueError:
         return None
+
+    current = None
+    if len(parts) >= 4 and parts[2].upper() == "CURRENT":
+        try:
+            current = float(parts[3])
+        except ValueError:
+            current = None
+
+    return angle, current
 
 def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -53,12 +67,16 @@ def main():
             send_torque(torque_cmd)
             continue
 
-        angle = parse_angle(data)
-        if angle is None:
+        parsed = parse_angle_current(data)
+        if parsed is None:
             continue
+        angle, motor_current = parsed
 
         torque_cmd = compute_torque(angle)
-        print(f"angle={angle:.3f} deg -> torque={torque_cmd:.3f} Nm")
+        if motor_current is not None:
+            print(f"angle={angle:.3f} deg, current={motor_current:.3f} A -> torque={torque_cmd:.3f} Nm")
+        else:
+            print(f"angle={angle:.3f} deg -> torque={torque_cmd:.3f} Nm")
 
         # Keep the loop close to 100 Hz
         next_tick += PERIOD

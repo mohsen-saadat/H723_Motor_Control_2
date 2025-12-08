@@ -33,6 +33,7 @@
 #include "myactuator_rmd/actuator_state/feedback.hpp"
 #include "stm32_can_driver.hpp"
 #include "stm32h7xx_ll_usart.h"
+#include <algorithm>   // for std::clamp
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -68,7 +69,6 @@ namespace {
   constexpr float kSpringCoefficient = 0.00002f;
   constexpr float kTorqueLimitNm = 4.0f;
   constexpr float kTorqueConstantNmPerA = 0.18f;
-  constexpr uint32_t kFeedbackPrintPeriodMs = 100U;
   constexpr uint32_t kLedBlinkPeriodMs = 500U;
   }
 /* USER CODE END PV */
@@ -179,83 +179,46 @@ int main(void)
     uint32_t const now = HAL_GetTick();
     float const current_angle = motor.getMultiTurnAngle();
 
-    uint8_t  cmd[32];
-    uint16_t n = udp_app_try_get_latest(cmd, sizeof(cmd));
-    if (n > 0)
-    {
-        if (n >= sizeof(cmd)) n = sizeof(cmd) - 1;
-        cmd[n] = '\0';  // allow strtof to read a C-string
-
-        char* payload = reinterpret_cast<char*>(cmd);
-
-        // Expect "TORQUE,<value>"
-        if (std::strncmp(payload, "TORQUE,", 7) == 0)
-        {
-            char* end = nullptr;
-            float new_torque = std::strtof(payload + 7, &end);
-            if (end != (payload + 7))     // parsed something
-            {
-                if (new_torque > kTorqueLimitNm)       new_torque = kTorqueLimitNm;
-                else if (new_torque < -kTorqueLimitNm) new_torque = -kTorqueLimitNm;
-
-                motor.sendTorqueSetpoint(new_torque, kTorqueConstantNmPerA);
-            }
-        }
-        // If you ever want to accept raw floats (no "TORQUE," prefix), you could add an else branch here.
-
-        char resp[48];
-        int len = std::snprintf(resp, sizeof(resp), "ANGLE,%.3f\n", current_angle);
-        if (len > 0)
-        {
-            udp_app_send_reply(resp, static_cast<uint16_t>(len));
-        }
-    }
-
-
-    /*
-    float const position_error = current_angle - kDesiredAngleDeg;
-    float torque_command = -kSpringCoefficient * position_error * std::fabs(position_error);
-    if (torque_command > kTorqueLimitNm)
-    {
-      torque_command = kTorqueLimitNm;
-    }
-    else if (torque_command < -kTorqueLimitNm)
-    {
-      torque_command = -kTorqueLimitNm;
-    }
-    auto feedback = motor.sendTorqueSetpoint(torque_command, kTorqueConstantNmPerA);
-    
-
-
     uint8_t cmd[32];
-    if (udp_app_try_get_latest(cmd, sizeof(cmd)) >= 6 &&
-        memcmp(cmd, "ANGLE?", 6) == 0) {
-        char resp[48];
-        int len = snprintf(resp, sizeof(resp), "ANGLE,%.3f\n", current_angle);
-        if (len > 0) {
-            udp_app_send_reply(resp, static_cast<uint16_t>(len));
-        }
-    }
-
-    */
-
-    
-
-    if ((now - last_feedback_print) >= kFeedbackPrintPeriodMs)
+    uint16_t n = udp_app_try_get_latest(cmd, sizeof(cmd));
+    if (n > 0) 
     {
-      //PrintFeedback(feedback);
-      last_feedback_print = now;
-    }
+      if (n >= sizeof(cmd)) n = sizeof(cmd) - 1;
+      cmd[n] = '\0';
 
-    if ((now - last_led_toggle) >= kLedBlinkPeriodMs)
-    {
-      HAL_GPIO_TogglePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin);
-      last_led_toggle = now;
-    }
-    HAL_Delay(5);
-    /* USER CODE END WHILE */
+      if (std::strncmp(reinterpret_cast<char*>(cmd), "TORQUE,", 7) == 0) 
+      {
+          char* end = nullptr;
+          float new_torque = std::strtof(reinterpret_cast<char*>(cmd) + 7, &end);
+          if (end != reinterpret_cast<char*>(cmd) + 7) 
+          {
+              new_torque = std::clamp(new_torque, -kTorqueLimitNm, kTorqueLimitNm);
 
-    /* USER CODE BEGIN 3 */
+              // This CAN transaction returns the angle & current in one go
+              auto feedback = motor.sendTorqueSetpoint(new_torque, kTorqueConstantNmPerA);
+
+              char resp[64];
+              int len = std::snprintf(resp,
+                                      sizeof(resp),
+                                      "ANGLE,%.3f,CURRENT,%.3f\n",
+                                      feedback.shaft_angle,
+                                      feedback.current);
+              if (len > 0) {
+                  udp_app_send_reply(resp, static_cast<uint16_t>(len));
+              }
+          }
+      }
+  }
+
+
+  if ((now - last_led_toggle) >= kLedBlinkPeriodMs)
+  {
+    HAL_GPIO_TogglePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin);
+    last_led_toggle = now;
+  }
+  /* USER CODE END WHILE */
+
+  /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
 }
