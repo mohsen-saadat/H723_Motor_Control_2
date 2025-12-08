@@ -22,7 +22,15 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <cmath>
+#include <cstdio>
+#include <cstring>
 
+#include "myactuator_rmd/actuator_interface.hpp"
+#include "myactuator_rmd/actuator_state/acceleration_type.hpp"
+#include "myactuator_rmd/actuator_state/feedback.hpp"
+#include "stm32_can_driver.hpp"
+#include "stm32h7xx_ll_usart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -49,7 +57,16 @@ TIM_HandleTypeDef htim2;
 UART_HandleTypeDef huart3;
 
 /* USER CODE BEGIN PV */
-
+namespace {
+  constexpr uint32_t kMotorCanId = 1U;
+  constexpr uint32_t kSpeedAccelDps2 = 8000U;
+  constexpr float kDesiredAngleDeg = 0.0f;
+  constexpr float kSpringCoefficient = 0.00002f;
+  constexpr float kTorqueLimitNm = 4.0f;
+  constexpr float kTorqueConstantNmPerA = 0.18f;
+  constexpr uint32_t kFeedbackPrintPeriodMs = 100U;
+  constexpr uint32_t kLedBlinkPeriodMs = 500U;
+  }
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -60,7 +77,11 @@ static void MX_FDCAN1_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART3_UART_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void ConfigureMotor(myactuator_rmd::ActuatorInterface& motor);
+static void PrintText(const char* text);
+static void PrintFeedback(myactuator_rmd::Feedback const& feedback);
+static void PrintRawBytes(uint8_t const* data, uint16_t length);
+static void WriteAccelerationRaw(std::uint32_t acceleration, myactuator_rmd::AccelerationType mode);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -113,6 +134,19 @@ int main(void)
   MX_USART3_UART_Init();
   MX_LWIP_Init();
   /* USER CODE BEGIN 2 */
+  Stm32CanDriver can_driver(&hfdcan1);
+  myactuator_rmd::ActuatorInterface motor(can_driver, kMotorCanId);
+
+  if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  ConfigureMotor(motor);
+  PrintText("\r\nStarting virtual spring torque control...\r\n");
+
+  uint32_t last_feedback_print = 0U;
+  uint32_t last_led_toggle = 0U;
 
   /* USER CODE END 2 */
 
@@ -120,16 +154,32 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    HAL_GPIO_TogglePin(LED_RED_GPIO_Port, LED_RED_Pin);
-    HAL_Delay(200);  // adjust the delay to the blink period you want (ms)
-    HAL_GPIO_TogglePin(LED_YELLOW_GPIO_Port, LED_YELLOW_Pin);
-    HAL_Delay(200);  // adjust the delay to the blink period you want (ms)
-    HAL_GPIO_TogglePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin);
-    HAL_Delay(200);  // adjust the delay to the blink period you want (ms)
-    HAL_GPIO_TogglePin(LED_YELLOW_GPIO_Port, LED_YELLOW_Pin);
-    HAL_Delay(200);  // adjust the delay to the blink period you want (ms)
-    HAL_GPIO_TogglePin(LED_RED_GPIO_Port, LED_RED_Pin);
-    HAL_Delay(200);  // adjust the delay to the blink period you want (ms)
+    uint32_t const now = HAL_GetTick();
+    float const current_angle = motor.getMultiTurnAngle();
+    float const position_error = current_angle - kDesiredAngleDeg;
+    float torque_command = -kSpringCoefficient * position_error * std::fabs(position_error);
+    if (torque_command > kTorqueLimitNm)
+    {
+      torque_command = kTorqueLimitNm;
+    }
+    else if (torque_command < -kTorqueLimitNm)
+    {
+      torque_command = -kTorqueLimitNm;
+    }
+    auto feedback = motor.sendTorqueSetpoint(torque_command, kTorqueConstantNmPerA);
+
+    if ((now - last_feedback_print) >= kFeedbackPrintPeriodMs)
+    {
+      PrintFeedback(feedback);
+      last_feedback_print = now;
+    }
+
+    if ((now - last_led_toggle) >= kLedBlinkPeriodMs)
+    {
+      HAL_GPIO_TogglePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin);
+      last_led_toggle = now;
+    }
+    HAL_Delay(5);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -392,6 +442,106 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+static void ConfigureMotor(myactuator_rmd::ActuatorInterface& motor)
+{
+  try
+  {
+    PrintText("Releasing brake...\r\n");
+    motor.releaseBrake();
+    PrintText("Configuring acceleration limits...\r\n");
+    WriteAccelerationRaw(kSpeedAccelDps2, myactuator_rmd::AccelerationType::VELOCITY_PLANNING_ACCELERATION);
+    WriteAccelerationRaw(kSpeedAccelDps2, myactuator_rmd::AccelerationType::VELOCITY_PLANNING_DECELERATION);
+  }
+  catch (const myactuator_rmd::Exception& error)
+  {
+    char buffer[128];
+    std::snprintf(buffer, sizeof(buffer), "RMD driver error: %s\r\n", error.what());
+    PrintText(buffer);
+    HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_SET);
+    Error_Handler();
+  }
+}
+
+static void PrintText(const char* text)
+{
+  if ((text == nullptr) || (std::strlen(text) == 0U))
+  {
+    return;
+  }
+  auto const length = static_cast<uint16_t>(std::strlen(text));
+  HAL_UART_Transmit(&huart3, reinterpret_cast<uint8_t const*>(text), length, HAL_MAX_DELAY);
+}
+
+
+static void PrintFeedback(myactuator_rmd::Feedback const& feedback)
+{
+  char buffer[128];
+  auto const written = std::snprintf(
+      buffer,
+      sizeof(buffer),
+      "T:%dC  I:%.2fA  Speed:%.1fdps  Angle:%.1fdeg\r\n",
+      feedback.temperature,
+      feedback.current,
+      feedback.shaft_speed,
+      feedback.shaft_angle);
+  if (written <= 0)
+  {
+    return;
+  }
+  auto const length = static_cast<uint16_t>(written);
+  PrintRawBytes(reinterpret_cast<uint8_t const*>(buffer), length);
+}
+
+static void WriteAccelerationRaw(std::uint32_t acceleration, myactuator_rmd::AccelerationType mode)
+{
+  uint8_t payload[7] = {};
+  payload[0] = static_cast<uint8_t>(mode);
+  payload[3] = static_cast<uint8_t>(acceleration & 0xFF);
+  payload[4] = static_cast<uint8_t>((acceleration >> 8) & 0xFF);
+  payload[5] = static_cast<uint8_t>((acceleration >> 16) & 0xFF);
+  payload[6] = static_cast<uint8_t>((acceleration >> 24) & 0xFF);
+
+  FDCAN_TxHeaderTypeDef header {};
+  header.Identifier = 0x140 + kMotorCanId;
+  header.IdType = FDCAN_STANDARD_ID;
+  header.TxFrameType = FDCAN_DATA_FRAME;
+  header.DataLength = FDCAN_DLC_BYTES_8;
+  header.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+  header.BitRateSwitch = FDCAN_BRS_OFF;
+  header.FDFormat = FDCAN_CLASSIC_CAN;
+  header.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+  header.MessageMarker = 0;
+
+  uint8_t frame[8] = {};
+  frame[0] = 0x43;
+  std::memcpy(&frame[1], payload, sizeof(payload));
+
+  HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &header, frame);
+
+  FDCAN_RxHeaderTypeDef rx_header {};
+  uint8_t rx_data[8] = {};
+  auto const start = HAL_GetTick();
+  while ((HAL_GetTick() - start) < 100U)
+  {
+    if (HAL_FDCAN_GetRxFifoFillLevel(&hfdcan1, FDCAN_RX_FIFO0) == 0U)
+    {
+      continue;
+    }
+    if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &rx_header, rx_data) == HAL_OK)
+    {
+      break;
+    }
+  }
+}
+
+static void PrintRawBytes(uint8_t const* data, uint16_t length)
+{
+  for (uint16_t i = 0; i < length; ++i)
+  {
+    while (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_TXE) == RESET) {}
+    LL_USART_TransmitData8(huart3.Instance, data[i]);
+  }
+}
 
 /* USER CODE END 4 */
 
