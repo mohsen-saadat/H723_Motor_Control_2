@@ -34,7 +34,7 @@ DESIRED_ANGLE_DEG = 0.0
 TORQUE_LIMIT_NM = 8.0
 
 # --- Shared queues / events ------------------------------------------------
-state_queue: "Queue[tuple[float, float, float, float]]" = Queue()
+state_queue: "Queue[tuple[float, float, float, float, float, float]]" = Queue()
 stop_event = threading.Event()
 
 
@@ -52,10 +52,10 @@ def compute_torque(angle_deg: float) -> float:
     return clamp(torque, TORQUE_LIMIT_NM)
 
 
-def parse_angle_current(packet: bytes) -> tuple[float, float] | None:
+def parse_reply(packet: bytes) -> tuple[float, float, float, float, float] | None:
     """
-    Expected format: ANGLE,<deg>[,CURRENT,<amps>]
-    Returns (angle_deg, current_amps or 0.0 if missing) or None on error.
+    Expected format: ANGLE,<deg>,CURRENT,<amps>,TORQUE,<Nm>,LOOP_US,<us>,WAIT_US,<us>
+    Returns tuple (angle, current, torque, loop_us, wait_us); missing fields default to 0.
     """
     text = packet.decode(errors="ignore").strip()
     parts = text.split(",")
@@ -66,13 +66,25 @@ def parse_angle_current(packet: bytes) -> tuple[float, float] | None:
     except ValueError:
         return None
 
-    current = 0.0
-    if len(parts) >= 4 and parts[2].upper() == "CURRENT":
+    current = torque = loop_us = wait_us = 0.0
+    idx = 2
+    while idx + 1 < len(parts):
+        key = parts[idx].strip().upper()
+        value = parts[idx + 1].strip()
+        idx += 2
         try:
-            current = float(parts[3])
+            numeric = float(value)
         except ValueError:
-            current = 0.0
-    return angle, current
+            continue
+        if key == "CURRENT":
+            current = numeric
+        elif key == "TORQUE":
+            torque = numeric
+        elif key == "LOOP_US":
+            loop_us = numeric
+        elif key == "WAIT_US":
+            wait_us = numeric
+    return angle, current, torque, loop_us, wait_us
 
 
 def networking_worker():
@@ -104,11 +116,11 @@ def networking_worker():
         except OSError:
             break
 
-        parsed = parse_angle_current(data)
+        parsed = parse_reply(data)
         if not parsed:
             continue
 
-        angle_deg, motor_current = parsed
+        angle_deg, motor_current, reported_torque, loop_us, wait_us = parsed
         torque_cmd = compute_torque(angle_deg)
 
         try:
@@ -118,7 +130,7 @@ def networking_worker():
         except Empty:
             pass
 
-        state_queue.put((time.time(), angle_deg, motor_current, torque_cmd))
+        state_queue.put((time.time(), angle_deg, motor_current, reported_torque, loop_us, wait_us))
 
     sock.close()
 
@@ -157,28 +169,32 @@ class GaugeView:
         self.current_var = tk.StringVar(value="Current: — A")
         self.torque_var = tk.StringVar(value="Torque cmd: — Nm")
         self.rate_var = tk.StringVar(value="Update rate: — Hz")
+        self.loop_var = tk.StringVar(value="Loop time: — µs")
+        self.wait_var = tk.StringVar(value="Wait time: — µs")
 
         tk.Label(root, textvariable=self.angle_var).grid(row=1, column=0, padx=8, sticky="w")
         tk.Label(root, textvariable=self.current_var).grid(row=1, column=1, padx=8, sticky="w")
         tk.Label(root, textvariable=self.torque_var).grid(row=1, column=2, padx=8, sticky="w")
-        tk.Label(root, textvariable=self.rate_var).grid(row=2, column=0, columnspan=3, pady=(4, 12))
+        tk.Label(root, textvariable=self.rate_var).grid(row=2, column=0, columnspan=3, pady=(4, 2))
+        tk.Label(root, textvariable=self.loop_var).grid(row=3, column=0, columnspan=3, pady=(0, 2))
+        tk.Label(root, textvariable=self.wait_var).grid(row=4, column=0, columnspan=3, pady=(0, 12))
 
         self.last_timestamp = None
 
-    def update_arrows(self, angle_deg: float, motor_current: float, torque_cmd: float):
+    def update_arrows(self, angle_deg: float, motor_current: float, torque_actual: float):
         self._set_polar_arrow(0, angle_deg)
 
-        current_scale = max(min(motor_current / 8.0, 1.0), -1.0)
-        current_angle = current_scale * 150.0
+        current_scale = max(min(motor_current / 16.0, 1.0), -1.0)
+        current_angle = current_scale * 360.0
         self._set_polar_arrow(1, current_angle)
 
-        torque_scale = max(min(torque_cmd / 1.6, 1.0), -1.0)
-        torque_angle = torque_scale * 150.0
+        torque_scale = max(min(torque_actual / 4.0, 1.0), -1.0)
+        torque_angle = torque_scale * 360.0
         self._set_polar_arrow(2, torque_angle)
 
         self.angle_var.set(f"Angle: {angle_deg:7.3f} deg")
         self.current_var.set(f"Current: {motor_current:6.3f} A")
-        self.torque_var.set(f"Torque cmd: {torque_cmd:6.3f} Nm")
+        self.torque_var.set(f"Torque cmd: {torque_actual:6.3f} Nm")
 
     def update_rate(self, timestamp: float):
         if self.last_timestamp is not None:
@@ -187,6 +203,12 @@ class GaugeView:
                 rate = 1.0 / dt
                 self.rate_var.set(f"Update rate: {rate:6.1f} Hz")
         self.last_timestamp = timestamp
+
+    def update_loop_time(self, loop_time_us: float):
+        self.loop_var.set(f"Loop time: {loop_time_us:7.1f} µs")
+
+    def update_wait_time(self, wait_time_us: float):
+        self.wait_var.set(f"Wait time: {wait_time_us:7.1f} µs")
 
     def _set_polar_arrow(self, index: int, angle_deg: float):
         canvas, arrow_id, center, radius = self.gauges[index]
@@ -208,9 +230,11 @@ def gui_loop():
             except Empty:
                 break
         if latest:
-            timestamp, angle_deg, motor_current, torque_cmd = latest
-            view.update_arrows(angle_deg, motor_current, torque_cmd)
+            timestamp, angle_deg, motor_current, torque_actual, loop_us, wait_us = latest
+            view.update_arrows(angle_deg, motor_current, torque_actual)
             view.update_rate(timestamp)
+            view.update_loop_time(loop_us)
+            view.update_wait_time(wait_us)
         root.after(GUI_PERIOD_MS, pump_queue)
 
     def on_close():

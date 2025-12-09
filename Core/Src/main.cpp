@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 #include "udp_client.h"
 #include "udp_app.h"
 #include "udp_app.h"
@@ -86,6 +87,8 @@ static void PrintText(const char* text);
 static void PrintFeedback(myactuator_rmd::Feedback const& feedback);
 static void PrintRawBytes(uint8_t const* data, uint16_t length);
 static void WriteAccelerationRaw(std::uint32_t acceleration, myactuator_rmd::AccelerationType mode);
+static void InitCycleCounter(void);
+static char const* ControlModeToString(myactuator_rmd::ControlMode mode);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -145,6 +148,8 @@ int main(void)
   MX_TIM2_Init();
   MX_USART3_UART_Init();
   MX_LWIP_Init();
+  InitCycleCounter();
+  float const cycles_to_microseconds = 1.0e6f / static_cast<float>(SystemCoreClock);
   /* USER CODE BEGIN 2 */
   HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_SET);  // turn on
   while (!netif_up_flag) {
@@ -165,7 +170,33 @@ int main(void)
   ConfigureMotor(motor);
   PrintText("\r\nStarting virtual spring torque control...\r\n");
 
-  uint32_t last_feedback_print = 0U;
+  // Ensure the motor is in torque/current loop before entering real-time control.
+  {
+    try
+    {
+      motor.sendTorqueSetpoint(0.0f, kTorqueConstantNmPerA);
+      auto const control_mode = motor.getControlMode();
+      char buffer[128];
+      std::snprintf(buffer,
+                    sizeof(buffer),
+                    "Motor control mode: %s (0x%02X)\r\n",
+                    ControlModeToString(control_mode),
+                    static_cast<unsigned>(static_cast<std::uint8_t>(control_mode)));
+      PrintText(buffer);
+      if (control_mode != myactuator_rmd::ControlMode::CURRENT)
+      {
+        PrintText("Warning: motor did not report CURRENT loop mode.\r\n");
+      }
+    }
+    catch (const myactuator_rmd::Exception& error)
+    {
+      char buffer[128];
+      std::snprintf(buffer, sizeof(buffer), "Failed to enter torque mode: %s\r\n", error.what());
+      PrintText(buffer);
+      Error_Handler();
+    }
+  }
+
   uint32_t last_led_toggle = 0U;
 
   /* USER CODE END 2 */
@@ -174,48 +205,67 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    uint32_t const loop_start_cycles = DWT->CYCCNT;
+    bool pending_reply = false;
+    myactuator_rmd::Feedback pending_feedback{};
+    float pending_torque_cmd = 0.0f;
+    float pending_can_time_us = 0.0f;
+
     MX_LWIP_Process();  // pump lwIP every iteration
 
     uint32_t const now = HAL_GetTick();
-    float const current_angle = motor.getMultiTurnAngle();
 
     uint8_t cmd[32];
     uint16_t n = udp_app_try_get_latest(cmd, sizeof(cmd));
-    if (n > 0) 
+    if (n > 0)
     {
-      if (n >= sizeof(cmd)) n = sizeof(cmd) - 1;
+      if (n >= sizeof(cmd))
+      {
+        n = sizeof(cmd) - 1;
+      }
       cmd[n] = '\0';
 
-      if (std::strncmp(reinterpret_cast<char*>(cmd), "TORQUE,", 7) == 0) 
+      if (std::strncmp(reinterpret_cast<char*>(cmd), "TORQUE,", 7) == 0)
       {
-          char* end = nullptr;
-          float new_torque = std::strtof(reinterpret_cast<char*>(cmd) + 7, &end);
-          if (end != reinterpret_cast<char*>(cmd) + 7) 
-          {
-              new_torque = std::clamp(new_torque, -kTorqueLimitNm, kTorqueLimitNm);
+        char* end = nullptr;
+        float new_torque = std::strtof(reinterpret_cast<char*>(cmd) + 7, &end);
+        if (end != reinterpret_cast<char*>(cmd) + 7)
+        {
+          new_torque = std::clamp(new_torque, -kTorqueLimitNm, kTorqueLimitNm);
 
-              // This CAN transaction returns the angle & current in one go
-              auto feedback = motor.sendTorqueSetpoint(new_torque, kTorqueConstantNmPerA);
-
-              char resp[64];
-              int len = std::snprintf(resp,
-                                      sizeof(resp),
-                                      "ANGLE,%.3f,CURRENT,%.3f\n",
-                                      feedback.shaft_angle,
-                                      feedback.current);
-              if (len > 0) {
-                  udp_app_send_reply(resp, static_cast<uint16_t>(len));
-              }
-          }
+          pending_feedback = motor.sendTorqueSetpoint(new_torque, kTorqueConstantNmPerA);
+          pending_can_time_us = can_driver.getLastWaitTimeUs();
+          pending_torque_cmd = new_torque;
+          pending_reply = true;
+        }
       }
-  }
+    }
 
+    if ((now - last_led_toggle) >= kLedBlinkPeriodMs)
+    {
+      HAL_GPIO_TogglePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin);
+      last_led_toggle = now;
+    }
 
-  if ((now - last_led_toggle) >= kLedBlinkPeriodMs)
-  {
-    HAL_GPIO_TogglePin(LED_GREEN_GPIO_Port, LED_GREEN_Pin);
-    last_led_toggle = now;
-  }
+    uint32_t const loop_cycles = DWT->CYCCNT - loop_start_cycles;
+    float const loop_time_us = static_cast<float>(loop_cycles) * cycles_to_microseconds;
+
+    if (pending_reply)
+    {
+      char resp[160];
+      int len = std::snprintf(resp,
+                              sizeof(resp),
+                              "ANGLE,%.3f,CURRENT,%.3f,TORQUE,%.3f,LOOP_US,%.1f,WAIT_US,%.1f\n",
+                              pending_feedback.shaft_angle,
+                              pending_feedback.current,
+                              pending_torque_cmd,
+                              loop_time_us,
+                              pending_can_time_us);
+      if (len > 0)
+      {
+        udp_app_send_reply(resp, static_cast<uint16_t>(len));
+      }
+    }
   /* USER CODE END WHILE */
 
   /* USER CODE BEGIN 3 */
@@ -478,6 +528,13 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+static void InitCycleCounter(void)
+{
+  CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+  DWT->CYCCNT = 0U;
+  DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+}
+
 static void ConfigureMotor(myactuator_rmd::ActuatorInterface& motor)
 {
   try
@@ -495,6 +552,17 @@ static void ConfigureMotor(myactuator_rmd::ActuatorInterface& motor)
     PrintText(buffer);
     HAL_GPIO_WritePin(LED_RED_GPIO_Port, LED_RED_Pin, GPIO_PIN_SET);
     Error_Handler();
+  }
+}
+
+static char const* ControlModeToString(myactuator_rmd::ControlMode mode)
+{
+  switch (mode)
+  {
+    case myactuator_rmd::ControlMode::CURRENT:   return "CURRENT";
+    case myactuator_rmd::ControlMode::VELOCITY:  return "VELOCITY";
+    case myactuator_rmd::ControlMode::POSITION:  return "POSITION";
+    default:                                     return "NONE";
   }
 }
 

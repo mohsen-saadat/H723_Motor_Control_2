@@ -22,10 +22,10 @@ def compute_torque(angle_deg):
     torque = -SPRING_COEFF * error * abs(error)
     return clamp(torque, TORQUE_LIMIT)
 
-def parse_angle_current(packet):
+def parse_reply(packet):
     """
-    Expected format: ANGLE,<deg>[,CURRENT,<amps>]
-    Returns (angle_deg, current_amps or None)
+    Expected format: ANGLE,<deg>,CURRENT,<amps>,TORQUE,<Nm>,LOOP_US,<us>,WAIT_US,<us>
+    Numeric fields after ANGLE are optional.
     """
     text = packet.decode(errors="ignore").strip()
     parts = text.split(",")
@@ -36,14 +36,26 @@ def parse_angle_current(packet):
     except ValueError:
         return None
 
-    current = None
-    if len(parts) >= 4 and parts[2].upper() == "CURRENT":
+    current = torque = loop_us = wait_us = None
+    idx = 2
+    while idx + 1 < len(parts):
+        key = parts[idx].strip().upper()
+        value = parts[idx + 1].strip()
+        idx += 2
         try:
-            current = float(parts[3])
+            numeric = float(value)
         except ValueError:
-            current = None
+            continue
+        if key == "CURRENT":
+            current = numeric
+        elif key == "TORQUE":
+            torque = numeric
+        elif key == "LOOP_US":
+            loop_us = numeric
+        elif key == "WAIT_US":
+            wait_us = numeric
 
-    return angle, current
+    return angle, current, torque, loop_us, wait_us
 
 def main():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -67,16 +79,21 @@ def main():
             send_torque(torque_cmd)
             continue
 
-        parsed = parse_angle_current(data)
+        parsed = parse_reply(data)
         if parsed is None:
             continue
-        angle, motor_current = parsed
+        angle, motor_current, reported_torque, loop_us, wait_us = parsed
 
         torque_cmd = compute_torque(angle)
-        if motor_current is not None:
-            print(f"angle={angle:.3f} deg, current={motor_current:.3f} A -> torque={torque_cmd:.3f} Nm")
-        else:
-            print(f"angle={angle:.3f} deg -> torque={torque_cmd:.3f} Nm")
+        fields = [
+            f"angle={angle:.3f} deg",
+            f"current={motor_current:.3f} A" if motor_current is not None else "current=—",
+            f"mcu_torque={reported_torque:.3f} Nm" if reported_torque is not None else "mcu_torque=—",
+            f"loop={loop_us:.1f} us" if loop_us is not None else "loop=—",
+            f"wait={wait_us:.1f} us" if wait_us is not None else "wait=—",
+            f"cmd={torque_cmd:.3f} Nm",
+        ]
+        print(", ".join(fields))
 
         # Keep the loop close to 100 Hz
         next_tick += PERIOD

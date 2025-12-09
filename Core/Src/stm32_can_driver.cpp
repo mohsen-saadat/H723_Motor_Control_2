@@ -85,6 +85,7 @@ void Stm32CanDriver::configureFilter(std::uint32_t actuator_id) {
 std::array<std::uint8_t, 8> Stm32CanDriver::waitForResponse(std::uint32_t expected_can_id) {
   std::array<std::uint8_t, 8> data {};
   FDCAN_RxHeaderTypeDef rx_header {};
+  uint32_t const wait_start_cycles = DWT->CYCCNT;
   auto const start = HAL_GetTick();
   while ((HAL_GetTick() - start) < rx_timeout_ms_) {
     if (HAL_FDCAN_GetRxFifoFillLevel(hfdcan_, FDCAN_RX_FIFO0) == 0U) {
@@ -96,6 +97,9 @@ std::array<std::uint8_t, 8> Stm32CanDriver::waitForResponse(std::uint32_t expect
     }
 
     if (rx_header.Identifier == expected_can_id) {
+      uint32_t const wait_cycles = DWT->CYCCNT - wait_start_cycles;
+      last_wait_time_us_ =
+          static_cast<float>(wait_cycles) * (1.0e6f / static_cast<float>(SystemCoreClock));
       return data;
     }
   }
